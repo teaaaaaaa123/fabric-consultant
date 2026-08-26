@@ -2,6 +2,7 @@
 import sys
 import json
 import os
+import re
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -31,7 +32,7 @@ def get_category_by_model(model):
 
 def get_table_by_category(category):
     table_map = {
-        '上衣': ['原算料表', '全里三件套', '无里三件套'],
+        '上衣': ['TF上衣', '原算料表', '全里三件套', '无里三件套', '猎装'],
         '大衣': ['大衣', '猎装'],
         '裤子': ['TF西裤', '原算料表', '短裤'],
         '马甲': ['原算料表', '全里三件套', '无里三件套']
@@ -94,6 +95,16 @@ def match_trousers_by_rules(model, rules, size=None, width=None):
                 exact_matches.append(result)
             else:
                 fallback_matches.append(result)
+    # TF系列同版型可能有多个门幅；未指定门幅时默认优先门幅74。
+    if str(model).upper().startswith('6TF') and width is None:
+        def tf_width_priority(result):
+            w = result['data'].get('门幅')
+            try:
+                return 0 if abs(float(w) - 74) < 0.1 else 1
+            except (TypeError, ValueError):
+                return 1
+        exact_matches.sort(key=tf_width_priority)
+        fallback_matches.sort(key=tf_width_priority)
     results.extend(exact_matches)
     results.extend(fallback_matches)
     return results
@@ -112,12 +123,30 @@ def query_fabric_calculation_by_rules(model, rules, size=None, width=None):
     rule3 = str(rules.get('规则3', ''))
     rule4 = str(rules.get('规则4', ''))
     has_double_row = '双排' in rule3
+    # 大衣/猎装表按版型编码逐行标注，优先做版型精确匹配。
+    model_upper = str(model).upper()
+    for table_name in relevant_tables:
+        if table_name not in ref_data['tables']:
+            continue
+        for row in ref_data['tables'][table_name].get('rows', []):
+            row_model = str(row.get('版型', '')).upper()
+            if row_model and row_model == model_upper:
+                if size and str(size) not in row:
+                    continue
+                if width is not None:
+                    w_val = row.get('门幅')
+                    if w_val is not None and abs(float(w_val) - float(width)) > 0.1:
+                        continue
+                return [{'source': f'参考表-{table_name}', 'data': row}]
     for table_name in relevant_tables:
         if table_name not in ref_data['tables']:
             continue
         for row in ref_data['tables'][table_name].get('rows', []):
             key = row.get('男装/素色或条纹', row.get('版型', ''))
             if not key:
+                continue
+            # 带版型编码的行（大衣/猎装表）只走上面的精确匹配，避免串行取错。
+            if re.fullmatch(r'\d[A-Z]{2,}\d+', str(row.get('版型', '')).upper()):
                 continue
             if has_double_row:
                 if '双排' not in str(key):
@@ -138,6 +167,12 @@ def query_fabric_calculation_by_rules(model, rules, size=None, width=None):
                 if w_val is not None and abs(float(w_val) - float(width)) > 0.1:
                     continue
             results.append({'source': f'参考表-{table_name}', 'data': row})
+    # 上衣默认按单西优先，避免只按“单排/全里”时误先匹配到套装行。
+    if category == '上衣':
+        results.sort(key=lambda r: (
+            0 if '单西' in str(r['data'].get('男装/素色或条纹', r['data'].get('版型', ''))) else 1,
+            1 if '套装' in str(r['data'].get('男装/素色或条纹', r['data'].get('版型', ''))) else 0,
+        ))
     return results
 
 def query_fabric_calculation(model, size=None, width=None):
@@ -202,7 +237,7 @@ def smart_query(model, size=None, width=None):
         print("\n未找到面料计算参考数据")
     return results
 
-def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=None, is_plaid=False):
+def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=None, is_plaid=False, suit_type=None):
     result = {
         'ok': False,
         'message': '',
@@ -216,6 +251,8 @@ def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=No
         'length_adjustment': 0,
         'waist_adjustment': 0,
         'plaid_adjustment': 0,
+        'suit_adjustment': 0,
+        'suit_type': suit_type,
         'breakdown': [],
         'total_consumption': None,
         'matched_item': None,
@@ -257,6 +294,26 @@ def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=No
     if base_consumption is None:
         result['message'] = '未找到匹配的耗量数据'
         return json.dumps(result, ensure_ascii=False, indent=2)
+    # 原算料表未标注门幅字段的最终匹配项，默认是门幅74。
+    # 用户指定非74门幅时，只有最终匹配项本身有明确门幅，或已知固定系数（60/50）才继续计算；
+    # 其他门幅（如65）不能自行估算，直接提示没有准确耗量。
+    if width is not None:
+        try:
+            width_value = float(width)
+        except (TypeError, ValueError):
+            width_value = None
+        if width_value is not None and abs(width_value - 74) > 0.1 and not any(abs(width_value - x) < 0.1 for x in (60, 50)):
+            matched_width = None
+            try:
+                if matched_item and matched_item.get('门幅') is not None:
+                    matched_width = float(matched_item.get('门幅'))
+            except (TypeError, ValueError):
+                matched_width = None
+            if matched_width is None or abs(matched_width - width_value) > 0.1:
+                result['message'] = f'参考表没有门幅{width_value:g}的准确耗量'
+                result['matched_item'] = matched_item
+                result['matched_source'] = matched_source
+                return json.dumps(result, ensure_ascii=False, indent=2)
     result['ok'] = True
     result['base_consumption'] = round(base_consumption, 1)
     result['matched_item'] = matched_item
@@ -278,6 +335,17 @@ def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=No
         total = base_consumption * width_factor
         result['width_adjustment'] = round(width_adj, 1)
         breakdown_list.append({'name': '门幅调整', 'value': round(width_adj, 1), 'description': width_desc})
+    # KK 系列西裤在 KN 耗量表基础上 +5cm（业务规则）。放在门幅调整之后，避免被门幅重赋 total 覆盖。
+    if str(model).upper().startswith('6KK') and category == '裤子':
+        kk_adj = 5
+        total += kk_adj
+        result['kk_adjustment'] = kk_adj
+        breakdown_list.append({
+            'name': 'KK系列加量',
+            'value': kk_adj,
+            'description': 'KK系列西裤在KN耗量表基础上+5cm'
+        })
+        result['notes'].append('KK系列西裤默认在KN耗量表基础上+5cm')
     if length_adj:
         adj = length_adj * 2
         total += adj
@@ -292,6 +360,20 @@ def smart_query_json(model, size=None, width=None, length_adj=None, waist_adj=No
         total += 10
         result['plaid_adjustment'] = 10
         breakdown_list.append({'name': '格子加量', 'value': 10, 'description': '格子面料增加10cm'})
+    suit_adj = 0
+    if suit_type:
+        suit_text = str(suit_type).strip()
+        if suit_text in ('2', '两件套', '套装'):
+            suit_adj = -20
+            suit_type = '两件套'
+        elif suit_text in ('3', '三件套'):
+            suit_adj = -30
+            suit_type = '三件套'
+        if suit_adj:
+            total += suit_adj
+            result['suit_adjustment'] = suit_adj
+            result['suit_type'] = suit_type
+            breakdown_list.append({'name': '套装调整', 'value': suit_adj, 'description': f'{suit_type}单件基础上减{abs(suit_adj)}cm'})
     result['breakdown'] = breakdown_list
     result['total_consumption'] = round(total, 1)
     result['message'] = '查询成功'
@@ -333,7 +415,7 @@ def main():
     if len(sys.argv) < 2:
         print('Usage:')
         print('  python query_fabric.py smart <版型> [尺码] [门幅]')
-        print('  python query_fabric.py json  <版型> [尺码] [门幅] [长度调整] [腰围调整] [格子标记]')
+        print('  python query_fabric.py json  <版型> [尺码] [门幅] [长度调整] [腰围调整] [格子标记] [套装类型]')
         print('  python query_fabric.py calc  <版型> [尺码] [门幅]')
         print('  python query_fabric.py pattern <版型>')
         print('  python query_fabric.py rules')
@@ -345,6 +427,7 @@ def main():
         print('    长度调整: 衣长/裤长调整量，单位cm（正数增加，负数减少）')
         print('    腰围调整: 腰围调整量，单位cm')
         print('    格子标记: 1=格子面料(+10cm)，0=平板面料(不加量)')
+        print('    套装类型: 两件套/套装=单件减20cm，三件套=单件减30cm')
         print()
         print('  示例:')
         print('    python query_fabric.py json 6KN340 54 130 0 0 0')
@@ -363,7 +446,8 @@ def main():
         length_adj = float(sys.argv[5]) if len(sys.argv) >= 6 else None
         waist_adj = float(sys.argv[6]) if len(sys.argv) >= 7 else None
         is_plaid = bool(int(sys.argv[7])) if len(sys.argv) >= 8 else False
-        result_json = smart_query_json(model, size, width, length_adj, waist_adj, is_plaid)
+        suit_type = sys.argv[8] if len(sys.argv) >= 9 else None
+        result_json = smart_query_json(model, size, width, length_adj, waist_adj, is_plaid, suit_type)
         print(result_json)
     elif command == 'calc' and len(sys.argv) >= 3:
         model = sys.argv[2]
